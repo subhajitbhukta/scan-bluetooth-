@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>BLE Connect + Auto Print (Robust)</title>
+</head>
+<body style="font-family: Arial; padding:20px;">
+  <h2>🔵 BLE Connect + Auto Print (Robust)</h2>
+  <button id="btn" style="padding:10px 20px; font-size:16px;">Connect & Maybe Print</button>
+  <pre id="log" style="background:#000;color:#0f0;padding:12px;margin-top:16px;height:420px;overflow:auto;"></pre>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg='') { logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+
+const COMMON_PRINTER_SERVICES = [
+  '0000ffe0-0000-1000-8000-00805f9b34fb', // FFE0 common
+  '0000fff0-0000-1000-8000-00805f9b34fb', // FFF0 common
+  '000018f0-0000-1000-8000-00805f9b34fb', // sometimes vendor-specific
+];
+
+const COMMON_PRINTER_CHARACTERISTICS = [
+  '0000ffe1-0000-1000-8000-00805f9b34fb', // FFE1 common
+  '0000fff1-0000-1000-8000-00805f9b34fb', // FFF1 common
+];
+
+async function findWritableCharacteristic(server, serviceUUIDCandidates, charUUIDCandidates) {
+  // 1) Try known pairs
+  for (const s of serviceUUIDCandidates) {
+    try {
+      const service = await server.getPrimaryService(s);
+      if (!service) continue;
+      for (const c of charUUIDCandidates) {
+        try {
+          const char = await service.getCharacteristic(c);
+          if (char) return { service, characteristic: char, via: `known pair ${s} / ${c}` };
+        } catch(e) { /* ignore */ }
+      }
+      // if known char not found, try to pick any writable characteristic from service
+      try {
+        const chars = await service.getCharacteristics();
+        for (const ch of chars) {
+          const props = ch.properties || {};
+          if (props.write || props.writeWithoutResponse) {
+            return { service, characteristic: ch, via: `writable char from ${s}` };
+          }
+        }
+      } catch(e) { /* ignore */ }
+    } catch(e) { /* service not present */ }
+  }
+
+  // 2) Fallback: enumerate all services and find writable char
+  try {
+    const services = await server.getPrimaryServices();
+    for (const svc of services) {
+      try {
+        const chars = await svc.getCharacteristics();
+        for (const ch of chars) {
+          const props = ch.properties || {};
+          if (props.write || props.writeWithoutResponse) {
+            return { service: svc, characteristic: ch, via: `enumerated ${svc.uuid}` };
+          }
+        }
+      } catch(e) { /* continue */ }
+    }
+  } catch(e) {
+    // ignore
+  }
+
+  // nothing found
+  return null;
+}
+
+// BLE write helper: chunk into <= MTU (20 bytes for many devices)
+async function writeInChunks(characteristic, dataUint8) {
+  const CHUNK = 20;
+  const writeWithoutResponse = characteristic.properties && characteristic.properties.writeWithoutResponse;
+  for (let i = 0; i < dataUint8.length; i += CHUNK) {
+    const slice = dataUint8.slice(i, i + CHUNK);
+    if (writeWithoutResponse && characteristic.writeValueWithoutResponse) {
+      await characteristic.writeValueWithoutResponse(slice);
+    } else {
+      await characteristic.writeValue(slice);
+    }
+    // small pause between chunks (some printers need it)
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
+
+document.getElementById('btn').onclick = async () => {
+  log('🔍 Requesting Bluetooth device (you will see picker)...');
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [...COMMON_PRINTER_SERVICES, 'device_information', 'battery_service']
+    });
+
+    log(`📌 Selected: ${device.name || 'Unknown'} (id: ${device.id})`);
+    device.addEventListener('gattserverdisconnected', () => log('⚠ Device disconnected'));
+
+    log('🔗 Connecting to GATT server...');
+    const server = await device.gatt.connect();
+    log('✅ Connected.');
+
+    // Try to detect printable characteristic
+    log('🔎 Looking for printer service/characteristic...');
+    const found = await findWritableCharacteristic(server, COMMON_PRINTER_SERVICES, COMMON_PRINTER_CHARACTERISTICS);
+
+    if (!found) {
+      log('ℹ No writable characteristic for printing detected. Device treated as NON-PRINTER.');
+      // Optionally read device info
+      try {
+        const info = await server.getPrimaryService('device_information');
+        const chars = await info.getCharacteristics();
+        for (const c of chars) {
+          try {
+            const val = await c.readValue();
+            const text = new TextDecoder().decode(val);
+            log(`• DeviceInformation ${c.uuid}: ${text}`);
+          } catch (e) { /* ignore read errors */ }
+        }
+      } catch (e) { /* no device info */ }
+      return;
+    }
+
+    log(`🖨️ Printer-like device detected via ${found.via}`);
+    const char = found.characteristic;
+    log(`• Service: ${found.service.uuid}`);
+    log(`• Characteristic: ${char.uuid}`);
+    log(`• Characteristic properties: ${Object.keys(char.properties).filter(k=>char.properties[k]).join(', ')}`);
+
+    // Prepare ESC/POS text (example)
+    const encoder = new TextEncoder();
+    const text = 
+`**** TEST PRINT ****
+Hello Brother!
+Connected: ${device.name || 'Unknown'}
+Date: ${new Date().toLocaleString()}
+
+\n\n\n`;
+    const data = encoder.encode(text);
+
+    log('📝 Sending print (chunked) ...');
+    await writeInChunks(char, data);
+
+    // Try send cutter command (may or may not be supported)
+    try {
+      const cut = new Uint8Array([0x1D, 0x56, 0x42, 0x00]); // GS V B 0
+      await writeInChunks(char, cut);
+      log('✂ Cut command (sent)');
+    } catch(e) {
+      log('✂ Cut command not supported or failed.');
+    }
+
+    log('✅ Print sequence sent. Check your printer output.');
+
+  } catch (err) {
+    log('❌ ERROR: ' + (err && err.message ? err.message : String(err)));
+    console.error(err);
+  }
+};
+</script>
+</body>
+</html>
